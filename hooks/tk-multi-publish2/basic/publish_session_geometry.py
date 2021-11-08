@@ -12,13 +12,15 @@ import os
 import maya.cmds as cmds
 import maya.mel as mel
 import sgtk
+import tempfile
+import shutil
 
 from tank_vendor import six
 
 HookBaseClass = sgtk.get_hook_baseclass()
 
 
-class MayaSessionGeometryPublishPlugin(HookBaseClass):
+class MayaSessionUSDPublishPlugin(HookBaseClass):
     """
     Plugin for publishing an open maya session.
 
@@ -40,10 +42,8 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
         """
 
         return """
-        <p>This plugin publishes session geometry for the current session. Any
-        session geometry will be exported to the path defined by this plugin's
-        configured "Publish Template" setting. The plugin will fail to validate
-        if the "AbcExport" plugin is not enabled or cannot be found.</p>
+        <p>This plugin will export the scene as an USD.
+        The plugin will fail to validate if the Maya USD plugin is not loaded</p>
         """
 
     @property
@@ -66,7 +66,7 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
         part of its environment configuration.
         """
         # inherit the settings from the base publish plugin
-        base_settings = super(MayaSessionGeometryPublishPlugin, self).settings or {}
+        base_settings = super(MayaSessionUSDPublishPlugin, self).settings or {}
 
         # settings specific to this class
         maya_publish_settings = {
@@ -93,7 +93,7 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
         accept() method. Strings can contain glob patters such as *, for example
         ["maya.*", "file.maya"]
         """
-        return ["maya.session.geometry"]
+        return ["maya.session.usd"]
 
     def accept(self, settings, item):
         """
@@ -147,13 +147,18 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
         # for use in subsequent methods
         item.properties["publish_template"] = publish_template
 
-        # check that the AbcExport command is available!
-        if not mel.eval('exists "AbcExport"'):
-            self.logger.debug(
-                "Item not accepted because alembic export command 'AbcExport' "
-                "is not available. Perhaps the plugin is not enabled?"
-            )
-            accepted = False
+        # check that the mayaUsdPlugin command is available!
+        if not cmds.pluginInfo("mayaUsdPlugin", query=True, loaded=True):
+            try:
+                # Try to load the plugin if it is installed
+                cmds.loadPlugin("mayaUsdPlugin" + ".mll")
+            except:
+                self.logger.debug(
+                    "Item not accepted because Maya USD plugin is not installed. "
+                    "You are probably using an older Maya version, currently USD is standard installed in Maya 2022+"
+                    "The plugin is also available to manually install via the Maya-USD Github."
+                )
+                accepted = False
 
         # because a publish template is configured, disable context change. This
         # is a temporary measure until the publisher handles context switching
@@ -190,13 +195,14 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
 
         # check that there is still geometry in the scene:
         if not cmds.ls(geometry=True, noIntermediate=True):
-            error_msg = (
-                "Validation failed because there is no geometry in the scene "
-                "to be exported. You can uncheck this plugin or create "
-                "geometry to export to avoid this error."
-            )
-            self.logger.error(error_msg)
-            raise Exception(error_msg)
+            if not cmds.ls(cameras=True):
+                error_msg = (
+                    "Validation failed because there is no geometry in the scene "
+                    "to be exported. You can uncheck this plugin or create "
+                    "geometry to export to avoid this error."
+                )
+                self.logger.error(error_msg)
+                raise Exception(error_msg)
 
         # get the configured work file template
         work_template = item.parent.properties.get("work_template")
@@ -227,7 +233,44 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
             item.properties["publish_version"] = work_fields["version"]
 
         # run the base class validation
-        return super(MayaSessionGeometryPublishPlugin, self).validate(settings, item)
+        return super(MayaSessionUSDPublishPlugin, self).validate(settings, item)
+
+    def rename_uv(self):
+        try:
+            current_selection = cmds.ls(sl=True)
+
+            # Select all geometry
+            geometry = cmds.ls(geometry=True)
+            geometries = cmds.listRelatives(geometry, p=True, path=True)
+
+            for mesh in geometries:
+                # Get all UV Sets
+                cmds.select(mesh, r=True)
+                uv_sets = cmds.polyUVSet(mesh, q=True, allUVSets=True)
+                uv_count = 0
+
+                # For all UV sets rename to uv and count with number
+                if not uv_sets is None:
+                    for uv in uv_sets:
+                        if uv_count == 0:
+                            uv_name = "uv"
+                            uv_count = uv_count + 1
+                        else:
+                            uv_name = 'uv' + str(uv_count)
+                            uv_count = uv_count + 1
+                        if not uv_name == uv:
+                            cmds.polyUVSet(
+                                rename=True,
+                                perInstance=True,
+                                newUVSet=uv_name,
+                                uvSet=uv,
+                            )
+
+            self.parent.log_debug("Renamed all uv sets.")
+            cmds.select(current_selection, r=True)
+
+        except Exception as e:
+            self.logger.debug(str(e))
 
     def publish(self, settings, item):
         """
@@ -241,49 +284,57 @@ class MayaSessionGeometryPublishPlugin(HookBaseClass):
 
         publisher = self.parent
 
+        # First make sure all the uv sets are named correctly
+        self.rename_uv()
+
         # get the path to create and publish
         publish_path = item.properties["path"]
 
+        # This is a quick fix to make sure directories exists before executing the usd export command
+        publish_path = publish_path.replace("\\", "/")
+        publish_dir = os.path.dirname(publish_path)
+        publish_name = os.path.basename(publish_path)
+
         # ensure the publish folder exists:
-        publish_folder = os.path.dirname(publish_path)
-        self.parent.ensure_folder_exists(publish_folder)
+        self.parent.ensure_folder_exists(publish_dir)
 
-        # set the alembic args that make the most sense when working with Mari.
-        # These flags will ensure the export of an Alembic file that contains
-        # all visible geometry from the current scene together with UV's and
-        # face sets for use in Mari.
-        alembic_args = [
-            # only renderable objects (visible and not templated)
-            "-renderableOnly",
-            # write shading group set assignments (Maya 2015+)
-            "-writeFaceSets",
-            # write uv's (only the current uv set gets written)
-            "-uvWrite",
-        ]
-
-        # find the animated frame range to use:
         start_frame, end_frame = _find_scene_animation_range()
-        if start_frame and end_frame:
-            alembic_args.append("-fr %d %d" % (start_frame, end_frame))
 
-        # Set the output path:
-        # Note: The AbcExport command expects forward slashes!
-        alembic_args.append("-file '%s'" % publish_path.replace("\\", "/"))
+        # This is the really long Maya command to export everything in the scene to USDA
+        usd_command: str = (
+            'file -force -options ";exportUVs=1;exportSkels=auto;exportSkin=auto;exportBlendShapes=1'
+            ";exportColorSets=1;defaultMeshScheme=none;defaultUSDFormat=usda;animation=1;eulerFilter"
+            "=0;staticSingleSample=0;startTime="
+            + str(start_frame)
+            + ";endTime="
+            + str(end_frame)
+            + ";frameStride=1;frameSample=0.0;parentScope"
+            "=;exportDisplayColor=0;shadingMode=useRegistry;convertMaterialsTo=UsdPreviewSurface"
+            ';exportInstances=1;exportVisibility=1;mergeTransformAndShape=1;stripNamespaces=0" -type "USD '
+            'Export" -pr -ea '
+        )
 
-        # build the export command.  Note, use AbcExport -help in Maya for
-        # more detailed Alembic export help
-        abc_export_cmd = 'AbcExport -j "%s"' % " ".join(alembic_args)
+        # Create temporary directory
+        with tempfile.TemporaryDirectory() as temp_directory:
+            # Setting file name
+            temp_file_path = os.path.join(temp_directory, publish_name).replace(
+                os.sep, "/"
+            )
+            file_path = ' "' + temp_file_path + '"'
 
-        # ...and execute it:
-        try:
-            self.parent.log_debug("Executing command: %s" % abc_export_cmd)
-            mel.eval(abc_export_cmd)
-        except Exception as e:
-            self.logger.error("Failed to export Geometry: %s" % e)
-            return
+            # Setting final command
+            usd_command = usd_command + file_path + ";"
 
-        # Now that the path has been generated, hand it off to the
-        super(MayaSessionGeometryPublishPlugin, self).publish(settings, item)
+            # Executing export command
+            self.parent.log_debug("Executing command: %s" % usd_command)
+            mel.eval(usd_command)
+
+            # Copy directory
+            shutil.copy2(temp_file_path, publish_dir)
+            self.parent.log_debug("Copied file to publish path")
+
+        # Now that the usd file has been generated and copied, hand it off to the
+        super(MayaSessionUSDPublishPlugin, self).publish(settings, item)
 
 
 def _find_scene_animation_range():
@@ -296,7 +347,7 @@ def _find_scene_animation_range():
     # if there aren't any animation curves then just return
     # a single frame:
     if not animation_curves:
-        return 1, 1
+        return 1001, 1001
 
     # something in the scene is animated so return the
     # current timeline.  This could be extended if needed
